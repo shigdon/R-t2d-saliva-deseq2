@@ -1,0 +1,13 @@
+# RStudio meta-files
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# salmon output
+data/
+tx_counts/
+.sf
+.counts
+
+

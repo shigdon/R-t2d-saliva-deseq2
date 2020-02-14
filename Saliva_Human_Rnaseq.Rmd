@@ -1,0 +1,608 @@
+---
+title: "RNAseq Analysis of Human Reads from Saliva Samples"
+author: "Shawn Higdon"
+date: "10/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tximport)
+library(DESeq2)
+library(tximportData)
+library(ensembldb)
+library(EnsDb.Hsapiens.v86)
+```
+
+# Parallelization
+```{r}
+library(BiocParallel)
+register(MulticoreParam(3))
+```
+
+
+### Read in Ensembl DB Homo Sapiens
+```{r}
+## make edb shortcut
+edb <- EnsDb.Hsapiens.v86
+
+## edb info
+edb
+
+## what organism for 'edb'?
+organism(edb)
+```
+
+# Metadata
+
+## Descriptive Names
+```{r}
+# Descriptive names for each sample-subject pair
+subject.code <- read_csv("./metadata/BCW_Descriptive_Sample_Names.csv", col_names = T)
+```
+
+## Sample Map
+```{r, message=TRUE}
+# Metadata table for each sample with ST prefix
+sample_map <- read_csv("./metadata/MARS-Keen_metadata.csv", col_types = "fffffffff")
+colnames(sample_map)
+# Create Descriptive Name
+sample_map <- sample_map %>% unite("Code", Sample_ID, Product, Sample_Type, Timepoint, sep = "_", remove = FALSE)
+
+# subset for saliva
+saliva_sample_map <- sample_map %>% dplyr::filter(Sample_Type == "Saliva")
+
+head(saliva_sample_map)
+
+```
+
+# TXIMPORT
+
+> Use `tximport` package to bring in the count data from `salmon`
+
+## Benefits of using `tximport`
+
+* Approach corrects for potential changes in gene length across samples (isoform usage)
+* Avoids discarding fragments that can align to multiple genes with homologous sequence (increase sensitivity)
+
+## Locate directory with output from `salmon quant`
+
+> Expt
+
+```{r}
+saliva_dir <- "."
+list.files(saliva_dir)
+```
+
+# Quant File Vector
+```{r}
+saliva_files <- file.path(saliva_dir, "data/saliva", saliva_sample_map$Seq_Label, "quant.sf") # Define files of Saliva
+names(saliva_files) <- saliva_sample_map$Code # assign names from map file to defined list of saliva input files
+names(saliva_files) # print names
+all(file.exists(saliva_files))
+print(saliva_files)
+```
+
+# Associate TX ID with Gene ID for gene-level summarization
+
+> Make a dataframe called `ensembl_tx2gene` with 2 columns: 1) Transcript ID and 2) gene ID. Transcript ID is in abundance files (quant files)
+
+```{r}
+listColumns(edb, "tx")
+
+ensembl_tx2gene <- transcripts(edb,
+                               columns = c("tx_id", "gene_id"),
+                               return.type = "DataFrame")
+
+head(ensembl_tx2gene, n=10)
+```
+
+## Use `tximport` (import transcript-level estimates from **Salmon** quant.sf files)
+
+> Import counts and keep tx_id labels for transcript import
+
+```{r}
+saliva_ensembl_txi.tx <- tximport(saliva_files, type = "salmon", txOut = TRUE)
+head(saliva_ensembl_txi.tx$counts)
+```
+
+> Summarize counts to gene level
+
+```{r}
+saliva_ensembl_txi.sum <- summarizeToGene(saliva_ensembl_txi.tx, ensembl_tx2gene, ignoreTxVersion = TRUE)
+all.equal(saliva_ensembl_txi.tx$counts, saliva_ensembl_txi.sum$counts)
+```
+
+## DESeq2
+
+### Design: ~ Timepoint (Contrast by sample timepoint)
+
+```{r}
+# Make rownames of sample map the same as column names in transcript table
+colnames(saliva_ensembl_txi.sum$counts)
+rownames(saliva_sample_map) <- saliva_sample_map$Code
+rownames(saliva_sample_map)
+
+ddsTxi_time <- DESeqDataSetFromTximport(saliva_ensembl_txi.sum,
+                                   colData = saliva_sample_map,
+                                   design = ~ Timepoint)
+```
+
+
+#### Pre-filtering
+
+> Remove transcripts that have less than ten counts in total for the entire row (all samples)
+
+```{r}
+ddsTxi_time.filter <- rowSums(counts(ddsTxi_time)) >= 10
+ddsTxi_time <- ddsTxi_time[ddsTxi_time.filter,]
+```
+
+#### Factor Level for Condition
+
+> Set the reference level to `initial` condition
+
+```{r}
+ddsTxi_time$Condition <- relevel(ddsTxi_time$Timepoint, ref = "Initial")
+```
+
+#### Differential Expression Analysis
+
+> Standard differential expression analysis steps are consolidated into a single fuction: `DESeq`
+
+* Results tables are generated using the function `results()`, which extracts a results table with log2 fold changes, *p* values and **adjusted *p* values**.
+
+* The `results()` function produces **log2-fold change** and **Wald test *p* value** for the last variable in the **design formula**
+
+  * If this is a factor, the comparison will be the **last level** of this variable over the **reference level**:
+
+```{r}
+ddsTxi_time <- DESeq(ddsTxi_time, parallel = TRUE)
+ddsTxi_time.res <- results(ddsTxi_time, parallel = TRUE)
+ddsTxi_time.res
+```
+
+#### Log fold change shrinkage for visualization and ranking
+
+> Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+
+> To shrink LFC, the `ddsTxi` object is passed through the function `lfcshrink()`.
+
+* Uses the `apeglm` method for effect size shrinkage: improves on previous estimator.
+
+```{r}
+resultsNames(ddsTxi_time)
+```
+
+```{r}
+ddsTxi_time.res.LFC <- lfcShrink(ddsTxi_time, coef = "Timepoint_Final_vs_Initial", type = "apeglm", parallel = TRUE)
+ddsTxi_time.res.LFC
+```
+
+> One can use parallelization if the dataset is large (dozens of coefficients, ~100s of samples)
+
+> Load `BiocParallel` package; set arguments `parallel=TRUE` and `BPPARAM=MulticoreParam(3)` for `DESeq`, `results` and `lfcshrink`
+
+#### Order results table by *adjusted p-value*
+
+```{r}
+ddsTxi_time.res.LFC.ordered <- ddsTxi_time.res.LFC[order(ddsTxi_time.res.LFC$padj),]
+```
+
+
+### Summarize the results table
+```{r}
+summary(ddsTxi_time.res.LFC.ordered)
+```
+
+> 18 genes with decreased LFC in expression for final timepoint compared with initial timepoint (expression decreased after treatment) at adjusted p-value less than 0.1
+
+### Export Results
+```{r}
+# subset
+ddsTxi_time.res.LFC.ordered.sig <- subset(ddsTxi_time.res.LFC.ordered, padj < 0.1)
+
+ddsTxi_time.res.LFC.ordered.sig
+
+write.csv(as.data.frame(ddsTxi_time.res.LFC.ordered.sig),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_timepoint_final_vs_initial_all_products_deseq2_lfcshrink_sig_results.csv")
+```
+
+### MA-plot
+
+```{r}
+plotMA(ddsTxi_time.res.LFC, ylim=c(-10,10))
+```
+
+
+### Design: ~ Micronutrient Fortification (Contrast by treatments that either contained micronutrient fortification or did not)
+
+```{r}
+colnames(saliva_sample_map)
+ddsTxi_fort <- DESeqDataSetFromTximport(saliva_ensembl_txi.sum,
+                                   colData = saliva_sample_map,
+                                   design = ~ Fortification)
+```
+
+#### Pre-filtering
+
+> Remove transcripts that have less than ten counts in total for the entire row (all samples)
+
+```{r}
+ddsTxi_fort.filter <- rowSums(counts(ddsTxi_fort)) >= 10
+ddsTxi_fort <- ddsTxi_fort[ddsTxi_fort.filter,]
+```
+
+#### Factor Level for Condition
+
+> Set the reference level to `initial` condition
+
+```{r}
+ddsTxi_fort$Condition <- relevel(ddsTxi_fort$Fortification, ref = "Non-Fort")
+```
+
+#### Differential Expression Analysis
+
+> Standard differential expression analysis steps are consolidated into a single fuction: `DESeq`
+
+* Results tables are generated using the function `results()`, which extracts a results table with log2 fold changes, *p* values and **adjusted *p* values**.
+
+* The `results()` function produces **log2-fold change** and **Wald test *p* value** for the last variable in the **design formula**
+
+  * If this is a factor, the comparison will be the **last level** of this variable over the **reference level**:
+
+```{r}
+ddsTxi_fort <- DESeq(ddsTxi_fort, parallel = TRUE)
+ddsTxi_fort.res <- results(ddsTxi_fort, parallel = TRUE)
+ddsTxi_fort.res
+```
+
+#### Log fold change shrinkage for visualization and ranking
+
+> Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+
+> To shrink LFC, the `ddsTxi` object is passed through the function `lfcshrink()`.
+
+* Uses the `apeglm` method for effect size shrinkage: improves on previous estimator.
+
+```{r}
+resultsNames(ddsTxi_fort)
+```
+
+```{r}
+ddsTxi_fort.res.LFC <- lfcShrink(ddsTxi_fort, coef = "Fortification_Fort_vs_Non.Fort", type = "apeglm", parallel = TRUE)
+ddsTxi_fort.res.LFC
+```
+
+> One can use parallelization if the dataset is large (dozens of coefficients, ~100s of samples)
+
+> Load `BiocParallel` package; set arguments `parallel=TRUE` and `BPPARAM=MulticoreParam(3)` for `DESeq`, `results` and `lfcshrink`
+
+#### Order results table by *adjusted p-value*
+
+```{r}
+ddsTxi_fort.res.LFC.ordered <- ddsTxi_fort.res.LFC[order(ddsTxi_fort.res.LFC$padj),]
+```
+
+
+### Summarize the results table
+```{r}
+summary(ddsTxi_fort.res.LFC.ordered)
+```
+
+> 18 genes with decreased LFC in expression for final timepoint compared with initial timepoint (expression decreased after treatment) at adjusted p-value less than 0.1
+
+### Export Results
+```{r}
+# subset
+ddsTxi_fort.res.LFC.ordered.sig <- subset(ddsTxi_fort.res.LFC.ordered, padj < 0.1)
+
+ddsTxi_fort.res.LFC.ordered.sig
+
+write.csv(as.data.frame(ddsTxi_fort.res.LFC.ordered.sig),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_fort_vs_non-fort_all_times_deseq2_lfcshrink_sig_results.csv")
+```
+
+### MA-plot
+
+```{r}
+plotMA(ddsTxi_fort.res.LFC, ylim=c(-10,10))
+```
+
+### Design: ~ Factorial (Product + Timepoint)
+
+```{r}
+colnames(saliva_sample_map)
+ddsTxi_MF <- DESeqDataSetFromTximport(saliva_ensembl_txi.sum,
+                                   colData = saliva_sample_map,
+                                   design = ~ Product + Timepoint)
+levels(ddsTxi_MF$Product)
+levels(ddsTxi_MF$Timepoint)
+```
+
+#### Pre-filtering
+
+> Remove transcripts that have less than ten counts in total for the entire row (all samples)
+
+```{r}
+ddsTxi_MF.filter <- rowSums(counts(ddsTxi_MF)) >= 10
+ddsTxi_MF <- ddsTxi_MF[ddsTxi_MF.filter,]
+```
+
+#### Differential Expression Analysis
+
+> Standard differential expression analysis steps are consolidated into a single fuction: `DESeq`
+
+* Results tables are generated using the function `results()`, which extracts a results table with log2 fold changes, *p* values and **adjusted *p* values**.
+
+* The `results()` function produces **log2-fold change** and **Wald test *p* value** for the last variable in the **design formula**
+
+  * If this is a factor, the comparison will be the **last level** of this variable over the **reference level**:
+    
+```{r}
+ddsTxi_MF <- DESeq(ddsTxi_MF, parallel = TRUE)
+```
+
+##### Contrast: Product B vs. D
+
+> Product B: 6 g Protein with Micronutrient Fortification
+
+> Product D: 6 g Protein without Micronutrient Fortification
+
+
+```{r}
+ddsTxi_MF.res.BvD <- results(ddsTxi_MF,
+                         parallel = TRUE,
+                         contrast = c("Product", "B", "D")) # B is numerator of log2 ratio, D is denominator of log2 ratio
+ddsTxi_MF.res.BvD
+```
+
+#### Order results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MF.res.BvD.ordered <- ddsTxi_MF.res.BvD[order(ddsTxi_MF.res.BvD$padj),]
+```
+
+### Summarize the results table
+```{r}
+summary(ddsTxi_MF.res.BvD.ordered)
+```
+
+
+### Export Results
+```{r}
+# subset to keep p-adj < 0.1
+ddsTxi_MF.res.BvD.sig1 <- subset(ddsTxi_MF.res.BvD.ordered, padj < 0.1)
+
+ddsTxi_MF.res.BvD.sig1
+
+write.csv(as.data.frame(ddsTxi_MF.res.BvD.sig1),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_product_plus_timepoint_B.vs.D_deseq2_noshrink_padj_0.1_results_all_samples.csv")
+
+
+# subset to keep p-adj < 0.05
+ddsTxi_MF.res.BvD.sig05 <- subset(ddsTxi_MF.res.BvD.ordered, padj < 0.05)
+
+ddsTxi_MF.res.BvD.sig05
+
+write.csv(as.data.frame(ddsTxi_MF.res.BvD.sig05),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_product_plus_timepoint_B.vs.D_deseq2_noshrink_padj_0.05_results_all_samples.csv")
+```
+
+### Design: Interactions-Factorial (Product + Timepoint)
+
+```{r}
+colnames(saliva_sample_map)
+
+ddsTxi_MFI <- ddsTxi_MF # copy
+
+ddsTxi_MFI$group <- factor(paste(ddsTxi_MFI$Product, ddsTxi_MFI$Timepoint, sep = "."))
+design(ddsTxi_MFI) <- ~ group
+levels(ddsTxi_MFI$group)
+
+ddsTxi_MFI <- DESeq(ddsTxi_MFI,
+                    parallel = TRUE)
+```
+
+#### Product B * Time
+
+> Product B: 6 g Protein with Micronutrient Fortification
+
+```{r}
+
+ddsTxi_MFI.B.time <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "B.Final", "B.Initial")) # B.Final is numerator of log2 ratio, B.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.B.time
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.B.time.ordered <- ddsTxi_MFI.B.time[order(ddsTxi_MFI.B.time$padj),]
+summary(ddsTxi_MFI.B.time.ordered)
+```
+
+> Only one gene detected for this comparison...
+
+#### Product D * Time
+
+> Product D: 6 g Protein without Micronutrient Fortification
+
+```{r}
+
+ddsTxi_MFI.D.time <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "D.Final", "D.Initial")) # D.Final is numerator of log2 ratio, D.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.D.time
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.D.time.ordered <- ddsTxi_MFI.D.time[order(ddsTxi_MFI.D.time$padj),]
+summary(ddsTxi_MFI.D.time.ordered)
+```
+
+> No results detected for this comparison
+
+#### Product B vs D - Final time contrast
+
+
+```{r}
+
+ddsTxi_MFI.B_vs_D.final <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "B.Final", "D.Final")) # B.Final is numerator of log2 ratio, D.Final is denominator of log2 ratio
+
+ddsTxi_MFI.B_vs_D.final
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.B_vs_D.final.ordered <- ddsTxi_MFI.B_vs_D.final[order(ddsTxi_MFI.B_vs_D.final$padj),]
+summary(ddsTxi_MFI.B_vs_D.final.ordered)
+```
+
+### Export Results
+```{r}
+# subset to keep p-adj < 0.1
+ddsTxi_MFI.res.BvD_final.sig1 <- subset(ddsTxi_MFI.B_vs_D.final.ordered, padj < 0.1)
+
+ddsTxi_MFI.res.BvD_final.sig1
+
+write.csv(as.data.frame(ddsTxi_MFI.res.BvD_final.sig1),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_B.vs.D_Time2_deseq2_noshrink_padj_0.1_results_all_samples.csv")
+
+
+# subset to keep p-adj < 0.05
+ddsTxi_MFI.res.BvD_final.sig05 <- subset(ddsTxi_MFI.B_vs_D.final.ordered, padj < 0.05)
+
+ddsTxi_MFI.res.BvD_final.sig05
+
+write.csv(as.data.frame(ddsTxi_MFI.res.BvD_final.sig1),
+          file = "DESeq2_LFC_Output/MARS_human_saliva_B.vs.D_Time2_deseq2_noshrink_padj_0.05_results_all_samples.csv")
+```
+
+> Results from this comparison of differential gene expression between treatment B and treatment D at the final sampling time point show 184 genes had differential expression with adjusted p-values lower than 0.1 and 66 genes with adjusted p-values lower than 0.05.
+
+#### Product B vs D - Initial time contrast
+
+
+```{r}
+
+ddsTxi_MFI.B_vs_D.initial <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "B.Initial", "D.Initial")) # B.Initial is numerator of log2 ratio, D.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.B_vs_D.initial
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.B_vs_D.initial.ordered <- ddsTxi_MFI.B_vs_D.initial[order(ddsTxi_MFI.B_vs_D.initial$padj),]
+summary(ddsTxi_MFI.B_vs_D.initial.ordered)
+```
+
+> For this comparison, 8 genes with LFC > 0 in B vs. D and 5 genes with LFC < 0 in B vs. D at adj. p-value < 0.1
+
+#### Product C vs A - Final time contrast
+
+> Product C: 12 grams protein with micronutrient fortification
+
+> Product A: 12 grams protein without micronutrient fortification
+
+```{r}
+
+ddsTxi_MFI.C_vs_A.final <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "C.Final", "A.Final")) # C.Final is numerator of log2 ratio, A.Final is denominator of log2 ratio
+
+ddsTxi_MFI.C_vs_A.final
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.C_vs_A.final.ordered <- ddsTxi_MFI.C_vs_A.final[order(ddsTxi_MFI.C_vs_A.final$padj),]
+summary(ddsTxi_MFI.C_vs_A.final.ordered)
+```
+
+> No significant results for this comparison
+
+#### Product C vs A - Initial time contrast
+
+```{r}
+
+ddsTxi_MFI.C_vs_A.initial <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "C.Initial", "A.Initial")) # C.Initial is numerator of log2 ratio, A.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.C_vs_A.initial
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.C_vs_A.initial.ordered <- ddsTxi_MFI.C_vs_A.initial[order(ddsTxi_MFI.C_vs_A.initial$padj),]
+summary(ddsTxi_MFI.C_vs_A.initial.ordered)
+```
+
+> No significant results for this comparison
+
+#### Product C * Time
+
+> Product C: 12 g Protein with Micronutrient Fortification
+
+```{r}
+
+ddsTxi_MFI.C.time <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "C.Final", "C.Initial")) # C.Final is numerator of log2 ratio, C.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.C.time
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.C.time.ordered <- ddsTxi_MFI.C.time[order(ddsTxi_MFI.C.time$padj),]
+summary(ddsTxi_MFI.C.time.ordered)
+```
+
+> 9 genes detected for this comparison with decreased expression at p-adj < 0.1
+
+#### Product A * Time
+
+> Product A: 12 g Protein without Micronutrient Fortification
+
+```{r}
+
+ddsTxi_MFI.A.time <- results(ddsTxi_MFI,
+                             parallel = TRUE,
+                             contrast = c("group", "A.Final", "A.Initial")) # A.Final is numerator of log2 ratio, A.Initial is denominator of log2 ratio
+
+ddsTxi_MFI.A.time
+```
+
+#### Order and summarize results table by *adjusted p-value*
+
+```{r}
+ddsTxi_MFI.A.time.ordered <- ddsTxi_MFI.A.time[order(ddsTxi_MFI.A.time$padj),]
+summary(ddsTxi_MFI.A.time.ordered)
+```
+
+> No genes were detected for this comparison with decreased expression at p-adj < 0.1
+
+## Summary
+
+> After grouping Factor level combinations of Product Treatment (A,B,C,D) and Sample Timepoint (Initial, Final), I created interaction groups. These groups were used to make statistical comparisons by modeling multiple conidition effects. Gene expression at final timepoints for treatments B vs. D was the only comparison that generated a list of DEGs using the "grouped factor term" method to test the effect of interactions on gene expression for the dataset.
+
